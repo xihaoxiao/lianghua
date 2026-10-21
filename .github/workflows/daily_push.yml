@@ -154,6 +154,16 @@ jobs:
             stock-cache-v5-${{ runner.os }}-
             stock-cache-v4-${{ runner.os }}-
 
+      - name: Bootstrap DuckDB cache (only on cache miss)
+        run: |
+          mkdir -p results
+          if [ ! -s results/stock_cache.duckdb ]; then
+            echo "DuckDB cache missing; downloading seed..."
+            python3 -u scripts/bootstrap_cache_seed.py
+          else
+            echo "DuckDB cache present; skip seed download."
+          fi
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -253,6 +263,16 @@ jobs:
             stock-cache-v6-${{ runner.os }}-
             stock-cache-v5-${{ runner.os }}-
             stock-cache-v4-${{ runner.os }}-
+
+      - name: Bootstrap DuckDB cache (only on cache miss)
+        run: |
+          mkdir -p results
+          if [ ! -s results/stock_cache.duckdb ]; then
+            echo "DuckDB cache missing; downloading seed..."
+            python3 -u scripts/bootstrap_cache_seed.py
+          else
+            echo "DuckDB cache present; skip seed download."
+          fi
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
