@@ -1,0 +1,13 @@
+name = "lianghua-scheduler"
+main = "src/index.js"
+compatibility_date = "2026-10-21"
+
+[vars]
+GITHUB_OWNER = "xihaoxiao"
+GITHUB_REPO = "lianghua"
+WORKFLOW_FILE = "daily_push.yml"
+GITHUB_REF = "main"
+
+# Cloudflare cron uses UTC: 05:15/09:15 UTC = 13:15/17:15 Asia/Shanghai.
+[triggers]
+crons = ["15 5 * * 1-5", "15 9 * * 1-5"]
