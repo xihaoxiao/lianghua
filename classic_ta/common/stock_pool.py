@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import time
 from datetime import datetime
 
 import pandas as pd
@@ -78,11 +80,14 @@ def _get_spot_df_em():
 
 
 def _get_spot_df_sina():
-    """全市场现货 —— 新浪源（降级源）。
+    """全市场现货 —— 新浪源（akshare 封装）。
 
     与东财源有两处差异，必须处理，否则数据会错：
       1. 代码带市场前缀（sh600000），要剥掉；
       2. 成交量单位是「股」，而东财和缓存日线用的都是「手」，要换算。
+
+    注意：akshare 的这个封装打的是 vip.stock.finance.sina.com.cn:80（明文 HTTP），
+    境外 IP 上会 read timeout，所以只作为第三顺位备源。
     """
     try:
         import akshare as ak
@@ -105,16 +110,135 @@ def _get_spot_df_sina():
         return None
 
 
+TENCENT_URL = "https://qt.gtimg.cn/q={codes}"
+TENCENT_BATCH = 60
+TENCENT_PATTERN = re.compile(r'v_(\w+)="([^"]*)"')
+
+
+def _a_share_symbols():
+    """A股代码列表（腾讯格式 sh600000 / sz000001），优先用本地 DuckDB 缓存。"""
+    symbols = []
+    for ts_code, _name, _industry in _fallback_duckdb_stocks():
+        code, _, market = str(ts_code).partition(".")
+        if not code or not market:
+            continue
+        symbols.append(f"{market.lower()}{code}")
+    return symbols
+
+
+def _get_spot_df_tencent():
+    """全市场现货 —— 腾讯源（HTTPS 443 直连，境外 IP 友好）。
+
+    字段取自 qt.gtimg.cn 的标准行情格式：
+      [1]名称 [2]代码 [3]最新价 [4]昨收 [5]今开 [6]成交量(手)
+      [30]时间 [32]涨跌% [33]最高 [34]最低 [37]成交额(万) [38]换手率
+
+    成交量单位是「手」，与东财和缓存日线一致，无需换算。
+    """
+    try:
+        import requests
+
+        symbols = _a_share_symbols()
+        if not symbols:
+            logger.warning("腾讯现货：本地缓存里没有 A 股代码列表")
+            return None
+
+        session = requests.Session()
+        session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+
+        rows = []
+        for start in range(0, len(symbols), TENCENT_BATCH):
+            batch = symbols[start:start + TENCENT_BATCH]
+            try:
+                resp = session.get(TENCENT_URL.format(codes=",".join(batch)), timeout=15)
+                resp.encoding = "gbk"
+            except Exception as exc:
+                logger.warning("腾讯现货批次失败(%s): %s", start, exc)
+                continue
+
+            for _sym, payload in TENCENT_PATTERN.findall(resp.text):
+                fields = payload.split("~")
+                if len(fields) < 40:
+                    continue
+                try:
+                    close = float(fields[3])
+                    prev_close = float(fields[4])
+                    volume = float(fields[6])
+                except (ValueError, IndexError):
+                    continue
+                if close <= 0 or prev_close <= 0:
+                    continue
+                amount = 0.0
+                if len(fields) > 35 and "/" in fields[35]:
+                    parts = fields[35].split("/")
+                    if len(parts) > 2:
+                        try:
+                            amount = float(parts[2])
+                        except ValueError:
+                            amount = 0.0
+                rows.append({
+                    COL_CODE: fields[2],
+                    COL_NAME: fields[1],
+                    COL_LAST: close,
+                    COL_OPEN: float(fields[5] or 0),
+                    COL_HIGH: float(fields[33] or 0),
+                    COL_LOW: float(fields[34] or 0),
+                    COL_PREV_CLOSE: prev_close,
+                    COL_VOLUME: volume,                 # 单位：手
+                    COL_AMOUNT: amount,                 # 单位：元
+                    COL_CHANGE_PCT: (close - prev_close) / prev_close * 100,
+                    COL_TURNOVER: float(fields[38] or 0) if len(fields) > 38 else 0.0,
+                    COL_VOL_RATIO: 0.0,                 # 腾讯不提供量比（下游未使用该字段）
+                })
+
+        if not rows:
+            logger.warning("腾讯现货返回空")
+            return None
+
+        df = pd.DataFrame(rows)
+        logger.info("腾讯现货可用: %s 只", len(df))
+        return df
+    except Exception as exc:
+        logger.warning("腾讯现货不可用: %s", exc)
+        return None
+
+
+# 现货 DataFrame 缓存：一次推送流程里会多次取现货（预热/新鲜度/实时行情/预筛选），
+# 不缓存的话每个源都要重试一遍，白白多花几分钟。
+_SPOT_CACHE = {"df": None, "ts": 0.0}
+SPOT_CACHE_TTL = 300.0
+
+
 def _get_spot_df():
-    """全市场现货 DataFrame：东财优先，失败自动降级新浪。"""
+    """全市场现货 DataFrame：东财 → 腾讯 → 新浪 依次降级。"""
     df = _get_spot_df_em()
     if df is not None:
         return df
 
-    print("  ⚠️ 东财实时行情不可用，降级到新浪源", flush=True)
+    print("  ⚠️ 东财实时行情不可用，降级到腾讯源", flush=True)
+    df = _get_spot_df_tencent()
+    if df is not None:
+        print(f"  ✅ 腾讯实时行情可用 ({len(df)} 只)", flush=True)
+        return df
+
+    print("  ⚠️ 腾讯实时行情不可用，降级到新浪源", flush=True)
     df = _get_spot_df_sina()
     if df is not None:
         print(f"  ✅ 新浪实时行情可用 ({len(df)} 只)", flush=True)
+    return df
+
+
+def _get_spot_df_cached():
+    """带 TTL 缓存的现货获取（同一进程内多次调用只拉一次）。"""
+    now = time.time()
+    cached = _SPOT_CACHE.get("df")
+    if cached is not None and now - _SPOT_CACHE.get("ts", 0) < SPOT_CACHE_TTL:
+        return cached
+
+    df = _get_spot_df()
+    if df is not None:
+        _SPOT_CACHE["df"] = df
+        _SPOT_CACHE["ts"] = now
     return df
 
 
@@ -219,7 +343,7 @@ def batch_prefilter_stocks():
     """Prefilter the spot universe using batch realtime quotes."""
     try:
         print("  Fetching spot quotes for prefilter...", flush=True)
-        df = _get_spot_df()
+        df = _get_spot_df_cached()
         if df is None or len(df) == 0:
             print("  spot provider returned empty data", flush=True)
             return None
@@ -256,7 +380,7 @@ def get_realtime_quotes():
     没有降级源的话盘中模式会静默退化成盘后模式。
     """
     try:
-        df = _get_spot_df()
+        df = _get_spot_df_cached()
         if df is None or len(df) == 0:
             return {}
 

@@ -218,9 +218,9 @@ def prewarm_data():
     tushare_ok = False
 
     try:
-        from classic_ta.common.stock_pool import _get_spot_df
+        from classic_ta.common.stock_pool import _get_spot_df_cached
 
-        df = _get_spot_df()
+        df = _get_spot_df_cached()
         if df is not None and len(df) > 100:
             akshare_ok = True
             print(f"  ✅ 实时行情源: 可用 ({len(df)}只)", flush=True)

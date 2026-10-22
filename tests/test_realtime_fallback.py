@@ -88,6 +88,16 @@ def _pad(df, code_col, prefix, total=120):
     return pd.concat([df, pd.DataFrame(extra_rows)], ignore_index=True)
 
 
+@pytest.fixture(autouse=True)
+def _clear_spot_cache():
+    """现货缓存是模块级的，测试之间必须清干净，否则互相串数据。"""
+    stock_pool._SPOT_CACHE["df"] = None
+    stock_pool._SPOT_CACHE["ts"] = 0.0
+    yield
+    stock_pool._SPOT_CACHE["df"] = None
+    stock_pool._SPOT_CACHE["ts"] = 0.0
+
+
 @pytest.fixture
 def fake_akshare(monkeypatch):
     """伪造 akshare 模块：可控制东财/新浪两个源各自的成败。"""
@@ -137,6 +147,122 @@ def test_em_source_used_when_available(fake_akshare):
     assert df is not None
     assert fake_akshare["em_calls"] == 1
     assert fake_akshare["sina_calls"] == 0
+
+
+# ──────────────────────────────────────────────────────────
+#  腾讯源（HTTPS 直连，第二顺位）
+# ──────────────────────────────────────────────────────────
+
+def _tencent_payload(code="600000", name="浦发银行", close=9.68, prev=9.66, open_=9.66,
+                     high=9.72, low=9.55, volume=599733, amount=578212864):
+    """按 qt.gtimg.cn 的标准字段顺序拼一条行情。"""
+    f = [""] * 100
+    f[0] = "1"
+    f[1] = name
+    f[2] = code
+    f[3] = str(close)
+    f[4] = str(prev)
+    f[5] = str(open_)
+    f[6] = str(volume)
+    f[30] = "20261022145604"
+    f[31] = f"{close - prev:.2f}"
+    f[32] = f"{(close - prev) / prev * 100:.2f}"
+    f[33] = str(high)
+    f[34] = str(low)
+    f[35] = f"{close}/{volume}/{amount}"
+    f[36] = str(volume)
+    f[37] = str(int(amount / 10000))
+    f[38] = "0.18"
+    return f'v_sh{code}="' + "~".join(f) + '";'
+
+
+TENCENT_PAYLOAD = _tencent_payload()
+
+
+def _fake_tencent(monkeypatch, payload=TENCENT_PAYLOAD):
+    import types
+
+    calls = {"n": 0}
+
+    class _Resp:
+        status_code = 200
+        encoding = None
+        text = payload
+
+    def get(url, timeout=None, **kwargs):
+        calls["n"] += 1
+        return _Resp()
+
+    requests_mod = types.ModuleType("requests")
+    requests_mod.Session = lambda: types.SimpleNamespace(
+        headers={},
+        get=get,
+    )
+    monkeypatch.setitem(sys.modules, "requests", requests_mod)
+    return calls
+
+
+def test_tencent_source_parses_fields(monkeypatch):
+    """腾讯字段解析：成交量单位是「手」，与东财/缓存日线一致。"""
+    _fake_tencent(monkeypatch)
+    monkeypatch.setattr(stock_pool, "_a_share_symbols", lambda: ["sh600000"])
+
+    df = stock_pool._get_spot_df_tencent()
+    assert df is not None
+    assert len(df) == 1
+
+    row = df.iloc[0]
+    assert row["代码"] == "600000"
+    assert row["名称"] == "浦发银行"
+    assert row["最新价"] == pytest.approx(9.68)
+    assert row["昨收"] == pytest.approx(9.66)
+    assert row["今开"] == pytest.approx(9.66)
+    assert row["最高"] == pytest.approx(9.72)
+    assert row["最低"] == pytest.approx(9.55)
+    assert row["成交量"] == pytest.approx(599733.0)     # 手，无需换算
+    assert row["成交额"] == pytest.approx(578212864.0)  # 元
+    assert row["涨跌幅"] == pytest.approx((9.68 - 9.66) / 9.66 * 100)
+
+
+def test_tencent_used_when_em_fails(monkeypatch, fake_akshare):
+    """东财失败 → 腾讯 → 新浪 的降级顺序。"""
+    fake_akshare["em_ok"] = False
+    _fake_tencent(monkeypatch)
+    monkeypatch.setattr(stock_pool, "_a_share_symbols", lambda: ["sh600000"])
+
+    df = _get_spot_df()
+    assert df is not None
+    assert len(df) == 1
+    assert fake_akshare["em_calls"] == 1
+    assert fake_akshare["sina_calls"] == 0, "腾讯可用时不该再打新浪"
+
+
+def test_tencent_failure_falls_back_to_sina(monkeypatch, fake_akshare):
+    """腾讯也挂 → 继续降级到新浪。"""
+    fake_akshare["em_ok"] = False
+    _fake_tencent(monkeypatch, payload="")   # 解析不出任何行
+    monkeypatch.setattr(stock_pool, "_a_share_symbols", lambda: ["sh600000"])
+
+    df = _get_spot_df()
+    assert df is not None
+    assert fake_akshare["sina_calls"] == 1
+
+
+def test_spot_cache_avoids_refetch(monkeypatch, fake_akshare):
+    """TTL 缓存：一次流程里不该反复拉现货。"""
+    fake_akshare["em_ok"] = False
+    _fake_tencent(monkeypatch)
+    monkeypatch.setattr(stock_pool, "_a_share_symbols", lambda: ["sh600000"])
+    monkeypatch.setitem(stock_pool._SPOT_CACHE, "df", None)
+    monkeypatch.setitem(stock_pool._SPOT_CACHE, "ts", 0.0)
+
+    first = stock_pool._get_spot_df_cached()
+    calls_after_first = fake_akshare["em_calls"]
+    second = stock_pool._get_spot_df_cached()
+
+    assert first is not None
+    assert second is first
+    assert fake_akshare["em_calls"] == calls_after_first, "缓存命中不应再打数据源"
 
 
 def test_falls_back_to_sina_when_em_fails(fake_akshare):
