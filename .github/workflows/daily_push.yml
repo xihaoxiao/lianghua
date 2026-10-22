@@ -74,10 +74,11 @@ jobs:
 
           TODAY=$(TZ='Asia/Shanghai' date +'%Y-%m-%d')
           ARTIFACT_NAME="push-results-${TODAY}-${SLOT}"
+          # 翻页查找（脚本内含原因说明）：gh api 默认只返回第一页 30 条，
+          # 而仓库里每次 CI 都会产生 coverage-* / *.dockerbuild 等无关 artifact，
+          # 一天就能把首页挤满 → 今天的 artifact 查不到 → 去重失效 → 重复推送。
           ARTIFACTS=$(
-            gh api "repos/${{ github.repository }}/actions/artifacts" \
-              --jq ".artifacts[] | select(.name == \"${ARTIFACT_NAME}\") | .id" \
-              2>/dev/null || true
+            bash scripts/has_push_artifact.sh "${{ github.repository }}" "${ARTIFACT_NAME}"
           )
 
           if [ -n "$ARTIFACTS" ]; then
