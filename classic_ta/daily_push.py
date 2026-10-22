@@ -20,6 +20,8 @@
 推送渠道：Server酱（管理员组+内测组）+ 微信公众号群发（盘后）
 """
 
+from __future__ import annotations
+
 import sys
 import os
 import json
@@ -264,7 +266,29 @@ def prewarm_data():
 #  主流程
 # ══════════════════════════════════════════════════════════
 
-def daily_push():
+def _resolve_intraday(mode: str | None, now: datetime) -> bool:
+    """决定是否盘中模式。
+
+    优先用调用方（工作流 / pipeline）指定的 mode：工作流已按触发时间算好时段，
+    容器启动晚了几分钟也不该改判（例如 13:15 触发、15:05 才开跑，
+    按墙上时钟会误判成盘后，导致中午收到盘后推送）。
+    没指定时才退回按北京时间窗口（9:00-15:00）判断。
+    """
+    if mode in ("intraday", "after_hours"):
+        return mode == "intraday"
+    return 9 <= now.hour < 15
+
+
+def daily_push(mode: str | None = None):
+    """执行一次每日推送。
+
+    Args:
+        mode: "intraday" / "after_hours"。由调用方（工作流 / pipeline）指定的时段。
+              传 None 时按本机北京时间判断（9:00-15:00 为盘中）。
+              优先用传入值：工作流已经根据触发时间算好了时段，
+              若容器启动较晚（比如 13:15 触发但排队到 15:05 才跑），
+              再按墙上时钟判断会把盘中误判成盘后。
+    """
     import time as _time
     _push_start = _time.time()
 
@@ -314,7 +338,9 @@ def daily_push():
 
     # 0.5 判断盘中/盘后模式
     now = datetime.now(_BJT)
-    is_intraday = 9 <= now.hour < 15
+    if mode in ("intraday", "after_hours"):
+        print(f"  时段来源: 调用方指定 --mode={mode}", flush=True)
+    is_intraday = _resolve_intraday(mode, now)
     degraded = False   # 盘中窗口内拿不到实时行情 → 降级为盘后数据（需在推送里标注）
     print(f"\n>>> {'盘中实时模式' if is_intraday else '盘后完整模式'} <<<", flush=True)
 

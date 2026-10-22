@@ -45,9 +45,9 @@ def main() -> None:
             expected, latest = ensure_freshness(current_mode)
             print(f"[pipeline] freshness_ok latest={latest} expected={expected}")
 
-            # 5. 执行推送
+            # 5. 执行推送（把当前生效的时段传下去，容器不再自己看钟判断）
             print("[pipeline] run daily push")
-            run_daily_push()
+            run_daily_push(mode=current_mode)
             print("[pipeline] success")
             return
         except Exception as exc:

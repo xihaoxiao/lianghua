@@ -371,3 +371,28 @@ def test_normal_push_message_not_marked():
 def test_beta_degraded_push_message_is_marked():
     title, _ = build_beta_push_message(None, [], [], {}, is_intraday=False, degraded=True)
     assert "降级" in title
+
+
+# ──────────────────────────────────────────────────────────
+#  时段判定（mode 优先于墙上时钟）
+# ──────────────────────────────────────────────────────────
+
+def test_mode_intraday_wins_over_late_wall_clock():
+    """13:15 触发但容器 15:05 才开跑 —— 必须仍是盘中，不能变成盘后。"""
+    from datetime import datetime
+
+    from classic_ta.daily_push import _resolve_intraday
+
+    late = datetime(2026, 10, 22, 15, 5)
+    assert _resolve_intraday("intraday", late) is True
+    assert _resolve_intraday("after_hours", late) is False
+
+
+def test_falls_back_to_wall_clock_without_mode():
+    from datetime import datetime
+
+    from classic_ta.daily_push import _resolve_intraday
+
+    assert _resolve_intraday(None, datetime(2026, 10, 22, 13, 30)) is True
+    assert _resolve_intraday(None, datetime(2026, 10, 22, 17, 30)) is False
+    assert _resolve_intraday(None, datetime(2026, 10, 22, 8, 0)) is False
