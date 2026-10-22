@@ -233,7 +233,9 @@ jobs:
             /bin/sh -lc "$CMD"
 
       - name: Upload results
-        if: always()
+        if: always() && env.DRY_RUN != 'true'
+        env:
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
         uses: actions/upload-artifact@v4
         with:
           name: push-results-${{ steps.date.outputs.today }}-${{ needs.check-duplicate.outputs.time_slot }}
@@ -339,7 +341,9 @@ jobs:
             /bin/sh -lc "$CMD"
 
       - name: Upload retry results
-        if: success()
+        if: success() && env.DRY_RUN != 'true'
+        env:
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
         uses: actions/upload-artifact@v4
         with:
           name: push-results-${{ steps.date.outputs.today }}-${{ needs.check-duplicate.outputs.time_slot }}
