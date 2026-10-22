@@ -126,3 +126,29 @@ def test_workflow_calls_the_script():
     assert "has_push_artifact.sh" in workflow, "工作流必须调用翻页查找脚本"
     # 不能再有裸的 gh api 查 artifact（会只拿到第一页）
     assert 'gh api "repos/${{ github.repository }}/actions/artifacts"' not in workflow
+
+
+def test_check_duplicate_job_checks_out_repo():
+    """回归防护：check-duplicate 用了仓库里的脚本，必须先 checkout。
+
+    真实故障：没 checkout → bash: scripts/has_push_artifact.sh: No such file or
+    directory → 退出码 127 → 整个去重 job 失败 → 定时推送直接挂掉。
+    """
+    import yaml
+
+    workflow = yaml.safe_load(
+        (REPO_ROOT / ".github" / "workflows" / "daily_push.yml").read_text(encoding="utf-8")
+    )
+    steps = workflow["jobs"]["check-duplicate"]["steps"]
+
+    uses = [str(step.get("uses", "")) for step in steps]
+    assert any(u.startswith("actions/checkout@") for u in uses), (
+        "check-duplicate 必须先 checkout 仓库，否则脚本不存在"
+    )
+
+    # checkout 必须在调用脚本的那一步之前
+    checkout_idx = next(i for i, u in enumerate(uses) if u.startswith("actions/checkout@"))
+    script_step_idx = next(
+        i for i, step in enumerate(steps) if "has_push_artifact.sh" in str(step.get("run", ""))
+    )
+    assert checkout_idx < script_step_idx, "checkout 必须在调用脚本之前"
