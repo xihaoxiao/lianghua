@@ -51,6 +51,73 @@ def _to_ts_code(code: str) -> str | None:
     return None
 
 
+def _normalize_spot_code(code: str) -> str:
+    """统一现货代码格式：新浪带市场前缀（sh600000），东财是裸代码（600000）。"""
+    code = str(code).strip()
+    if len(code) == 8 and code[:2].isalpha():
+        return code[2:]
+    return code
+
+
+def _get_spot_df_em():
+    """全市场现货 —— 东财源（首选）。
+
+    东财在境外/云主机 IP 上经常被限流或直接返回非 JSON 内容，
+    此时自动降级到新浪源。
+    """
+    try:
+        import akshare as ak
+
+        df = ak.stock_zh_a_spot_em()
+        if df is not None and len(df) > 100:
+            return df
+        logger.warning("东财现货返回异常（%s 行）", 0 if df is None else len(df))
+    except Exception as exc:
+        logger.warning("东财现货不可用: %s", exc)
+    return None
+
+
+def _get_spot_df_sina():
+    """全市场现货 —— 新浪源（降级源）。
+
+    与东财源有两处差异，必须处理，否则数据会错：
+      1. 代码带市场前缀（sh600000），要剥掉；
+      2. 成交量单位是「股」，而东财和缓存日线用的都是「手」，要换算。
+    """
+    try:
+        import akshare as ak
+
+        df = ak.stock_zh_a_spot()
+        if df is None or len(df) == 0:
+            logger.warning("新浪现货返回空")
+            return None
+
+        df = df.copy()
+        if _has_col(df, COL_CODE):
+            df[COL_CODE] = df[COL_CODE].map(_normalize_spot_code)
+        if _has_col(df, COL_VOLUME):
+            df[COL_VOLUME] = df[COL_VOLUME].astype(float) / 100.0
+
+        logger.info("新浪现货可用: %s 只", len(df))
+        return df
+    except Exception as exc:
+        logger.warning("新浪现货不可用: %s", exc)
+        return None
+
+
+def _get_spot_df():
+    """全市场现货 DataFrame：东财优先，失败自动降级新浪。"""
+    df = _get_spot_df_em()
+    if df is not None:
+        return df
+
+    print("  ⚠️ 东财实时行情不可用，降级到新浪源", flush=True)
+    df = _get_spot_df_sina()
+    if df is not None:
+        print(f"  ✅ 新浪实时行情可用 ({len(df)} 只)", flush=True)
+    return df
+
+
 def _calc_intraday_qfq_ratio(df: pd.DataFrame, realtime_quote: dict, today: pd.Timestamp) -> float:
     """Map raw realtime prices into the cached forward-adjusted price space."""
     prev_close_raw = _to_float(realtime_quote.get("PrevClose"), 0.0)
@@ -70,26 +137,21 @@ def _calc_intraday_qfq_ratio(df: pd.DataFrame, realtime_quote: dict, today: pd.T
 
 def get_all_a_stocks():
     """Return all listed A-shares as ``(ts_code, name, industry)`` tuples."""
-    try:
-        import akshare as ak
-
-        df = ak.stock_zh_a_spot_em()
-        if df is not None and len(df) > 100:
-            stocks = []
-            for _, row in df.iterrows():
-                code = str(_row_get(row, COL_CODE, ""))
-                name = str(_row_get(row, COL_NAME, ""))
-                if not code or name.startswith("ST") or name.startswith("*ST") or name.startswith("N"):
-                    continue
-                ts_code = _to_ts_code(code)
-                if ts_code is None:
-                    continue
-                stocks.append((ts_code, name, str(_row_get(row, COL_INDUSTRY, ""))))
-            if len(stocks) > 100:
-                logger.info("akshare stock list fetched: %s", len(stocks))
-                return stocks
-    except Exception as exc:
-        logger.warning("akshare stock list failed: %s", exc)
+    df = _get_spot_df()
+    if df is not None:
+        stocks = []
+        for _, row in df.iterrows():
+            code = str(_row_get(row, COL_CODE, ""))
+            name = str(_row_get(row, COL_NAME, ""))
+            if not code or name.startswith("ST") or name.startswith("*ST") or name.startswith("N"):
+                continue
+            ts_code = _to_ts_code(code)
+            if ts_code is None:
+                continue
+            stocks.append((ts_code, name, str(_row_get(row, COL_INDUSTRY, ""))))
+        if len(stocks) > 100:
+            logger.info("现货股票列表: %s 只", len(stocks))
+            return stocks
 
     try:
         import tushare as ts
@@ -156,12 +218,10 @@ def _fallback_duckdb_stocks():
 def batch_prefilter_stocks():
     """Prefilter the spot universe using batch realtime quotes."""
     try:
-        import akshare as ak
-
-        print("  Fetching akshare spot quotes for prefilter...", flush=True)
-        df = ak.stock_zh_a_spot_em()
+        print("  Fetching spot quotes for prefilter...", flush=True)
+        df = _get_spot_df()
         if df is None or len(df) == 0:
-            print("  akshare returned empty spot data", flush=True)
+            print("  spot provider returned empty data", flush=True)
             return None
         print(f"  Retrieved {len(df)} spot rows", flush=True)
 
@@ -190,11 +250,13 @@ def batch_prefilter_stocks():
 
 
 def get_realtime_quotes():
-    """Return realtime quotes keyed by ts_code."""
-    try:
-        import akshare as ak
+    """Return realtime quotes keyed by ts_code.
 
-        df = ak.stock_zh_a_spot_em()
+    数据源链路：东财 -> 新浪。CI 环境（GitHub runner）常被东财限流，
+    没有降级源的话盘中模式会静默退化成盘后模式。
+    """
+    try:
+        df = _get_spot_df()
         if df is None or len(df) == 0:
             return {}
 

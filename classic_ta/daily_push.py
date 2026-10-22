@@ -218,15 +218,16 @@ def prewarm_data():
     tushare_ok = False
 
     try:
-        import akshare as ak
-        df = ak.stock_zh_a_spot_em()
+        from classic_ta.common.stock_pool import _get_spot_df
+
+        df = _get_spot_df()
         if df is not None and len(df) > 100:
             akshare_ok = True
-            print(f"  ✅ akshare实时行情: 可用 ({len(df)}只)", flush=True)
+            print(f"  ✅ 实时行情源: 可用 ({len(df)}只)", flush=True)
         else:
-            print("  ❌ akshare实时行情: 数据异常", flush=True)
+            print("  ❌ 实时行情源: 数据异常", flush=True)
     except Exception as e:
-        print(f"  ❌ akshare实时行情: 不可用 ({e})", flush=True)
+        print(f"  ❌ 实时行情源: 不可用 ({e})", flush=True)
 
     try:
         import tushare as ts
@@ -314,6 +315,7 @@ def daily_push():
     # 0.5 判断盘中/盘后模式
     now = datetime.now(_BJT)
     is_intraday = 9 <= now.hour < 15
+    degraded = False   # 盘中窗口内拿不到实时行情 → 降级为盘后数据（需在推送里标注）
     print(f"\n>>> {'盘中实时模式' if is_intraday else '盘后完整模式'} <<<", flush=True)
 
     # 1. OAMV活跃市值择时
@@ -346,13 +348,15 @@ def daily_push():
     _t = _time.time()
     realtime_quotes = None
     if is_intraday:
-        print("\n[3/6] 获取akshare实时行情（盘中拼接）...", flush=True)
+        print("\n[3/6] 获取实时行情（东财→新浪）...", flush=True)
         realtime_quotes = get_realtime_quotes()
         if realtime_quotes:
             print(f"  实时行情: {len(realtime_quotes)}只 → 将拼接为今日实时K线", flush=True)
         else:
-            print("  实时行情获取失败，回退到盘后模式", flush=True)
+            # 所有源都挂了：降级成盘后数据，但必须显式标注，不能假装是盘中推送
+            print("  ⚠️ 实时行情获取失败（所有数据源均不可用），本次降级为盘后数据", flush=True)
             is_intraday = False
+            degraded = True
     else:
         print("\n[3/6] 盘后模式，跳过实时行情获取", flush=True)
     _step_time("实时行情", _t)
@@ -482,14 +486,15 @@ def daily_push():
 
     # 构建推送消息（两组格式）
     print("\n构建推送消息...", flush=True)
-    admin_title, admin_desp = build_push_message(oamv_status, signals, industry_stats, BEST_PARAMS, is_intraday=is_intraday)
-    beta_title, beta_desp = build_beta_push_message(oamv_status, signals, industry_stats, BEST_PARAMS, is_intraday=is_intraday)
+    admin_title, admin_desp = build_push_message(oamv_status, signals, industry_stats, BEST_PARAMS, is_intraday=is_intraday, degraded=degraded)
+    beta_title, beta_desp = build_beta_push_message(oamv_status, signals, industry_stats, BEST_PARAMS, is_intraday=is_intraday, degraded=degraded)
 
     # 保存结果
     result = {
         "scan_time": datetime.now(_BJT).strftime("%Y-%m-%d %H:%M:%S"),
         "version": "V6.4-精细动态评分",
-        "mode": "盘中实时" if is_intraday else "盘后完整",
+        "mode": "盘中实时" if is_intraday else ("盘后完整(降级)" if degraded else "盘后完整"),
+        "degraded": degraded,
         "params": {
             "entry_quality_min_score": BEST_PARAMS["entry_quality_min_score"],
             "ambush_j_oversold": BEST_PARAMS["ambush_j_oversold"],
@@ -545,9 +550,9 @@ def daily_push():
         print("  提示: GitHub Actions 的 retry-push job 将自动重试", flush=True)
 
     # ══════════════════════════════════════════════════════════
-    #  公众号群发（仅盘后模式）
+    #  公众号群发（仅盘后模式；盘中降级的运行也不算盘后，不发）
     # ══════════════════════════════════════════════════════════
-    if not is_intraday:
+    if not is_intraday and not degraded:
         print("\n" + "=" * 60, flush=True)
         print("📢 公众号群发（盘后）", flush=True)
         print("=" * 60, flush=True)
@@ -567,7 +572,10 @@ def daily_push():
             import traceback
             traceback.print_exc()
     else:
-        print("\n📢 盘中模式，跳过公众号群发（仅盘后群发）", flush=True)
+        if degraded:
+            print("\n📢 盘中降级运行，跳过公众号群发（仅盘后群发）", flush=True)
+        else:
+            print("\n📢 盘中模式，跳过公众号群发（仅盘后群发）", flush=True)
 
     # 摘要
     print(f"\n{'='*80}")
