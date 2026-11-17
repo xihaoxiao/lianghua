@@ -15,10 +15,21 @@ workers_dev = true
 enabled = true
 
 [vars]
+# 单目标回退用（未配置 TARGETS 时生效，保持旧行为）
 GITHUB_OWNER = "xihaoxiao"
 GITHUB_REPO = "lianghua"
 WORKFLOW_FILE = "daily_push.yml"
 GITHUB_REF = "main"
+
+# 多目标配置：JSON 数组，每个目标独立指定要触发的仓库与 cron。
+#   - lianghua  : xihaoxiao/lianghua 的 daily_push.yml（盘中 13:15 + 盘后 17:15 北京时间）
+#   - ashares   : xihaoxiao/D-project-action 的 daily.yml（盘后，复用 lianhua 的 17:15 cron）
+# 说明：本账号 Free 计划 cron 额度已满（lianhua 2 + bigapush 3 = 5），无法新增 cron。
+#       因此 ashares 直接复用 lianhua 的盘后 cron（15 9 UTC = 17:15 北京时间），不增加触发数。
+#       若需要 ashares 单独在 17:55 跑，需升级 Workers Paid（额度 1000）或挪动 lianhua 的盘后 cron。
+# crons 为 null 表示该目标响应 Worker 的所有 cron。
+# 故意用单引号包裹，避免 JSON 里的双引号被 TOML 转义。
+TARGETS = '[{"name":"lianghua","owner":"xihaoxiao","repo":"lianghua","workflow":"daily_push.yml","ref":"main","crons":["15 5 * * mon-fri","15 9 * * mon-fri"]},{"name":"ashares","owner":"xihaoxiao","repo":"D-project-action","workflow":"daily.yml","ref":"main","crons":["15 9 * * mon-fri"]}]'
 
 # Secrets 不能写在这里（会明文进仓库），用命令设置：
 #   npx wrangler secret put GH_TOKEN        # GitHub PAT
@@ -28,7 +39,20 @@ GITHUB_REF = "main"
 #   fine-grained PAT → Repository permissions → Actions: Read and write
 #   classic PAT      → 勾选 repo scope
 
-# Cloudflare cron 用 UTC：05:15 / 09:15 UTC = 13:15 / 17:15 北京时间
-# GitHub 自带的 6 个 schedule 保留作兜底（concurrency group + artifact 去重防重复推送）
+# Cloudflare cron 一律按 UTC 解释：
+#   15 5 * * mon-fri  = 13:15 北京时间（盘中，lianghua）
+#   15 9 * * mon-fri  = 17:15 北京时间（盘后，lianghua + ashares 共用）
+#
+# ⚠️ 星期字段必须写成 mon-fri 这类缩写，不要写 1-5：
+#    Cloudflare 的星期是 1=周日 … 7=周六（官方文档明确说明，与常见 cron 的
+#    0/7=周日不同）。原先写 `1-5`，实际含义是「周日~周四」——周五整天不触发、
+#    周日白跑一次（工作流内 check_trading_day 会立刻退出，不推送）。
+#    文档：https://developers.cloudflare.com/workers/configuration/cron-triggers/
+#    对应关系：mon-fri 等价于 2-6。
+#
+# 注意：ashares 复用 15 9 这条 cron，不再单独新增（Free 计划 5 cron 额度已满）。
+# 每个目标只响应自己 crons 里列出的时刻（见 TARGETS；两处写法必须一致，
+# Worker 会先按字符串精确匹配，再按「时:分」兜底）。
+# GitHub 自带的 schedule 已移除，Worker 是唯一触发源。
 [triggers]
-crons = ["15 5 * * 1-5", "15 9 * * 1-5"]
+crons = ["15 5 * * mon-fri", "15 9 * * mon-fri"]

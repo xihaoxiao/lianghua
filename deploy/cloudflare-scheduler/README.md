@@ -16,6 +16,12 @@ GitHub 自带的 6 个 `schedule` 事件**保留**作为兜底：万一 Worker �
 GitHub 那边延迟几十分钟也会把当天的推送补上。工作流内的
 `concurrency: daily-push` + artifact 去重保证不会重复推送。
 
+> **多目标支持**：本 Worker 现在通过 `wrangler.toml` 里的 `TARGETS`（JSON 数组）同时触发多个仓库，
+> 每个目标可独立指定 cron。当前包含 `lianghua`（盘中 13:15 + 盘后 17:15）与 `ashares`
+> （`xihaoxiao/D-project-action` 的 `daily.yml`，盘后复用 17:15 那条 cron）。
+> 单目标变量（`GITHUB_OWNER` 等）仅在未配置 `TARGETS` 时作为回退生效。
+> 新增/移除目标只需改 `TARGETS`，然后 `wrangler deploy`。
+
 ---
 
 ## 一、需要的配置
@@ -43,11 +49,24 @@ GitHub 那边延迟几十分钟也会把当天的推送补上。工作流内的
 ### Cron Trigger（Worker → Settings → Triggers → Cron Triggers）
 
 ```
-15 5 * * 1-5     # 05:15 UTC = 13:15 北京时间（盘中）
-15 9 * * 1-5     # 09:15 UTC = 17:15 北京时间（盘后）
+15 5 * * mon-fri   # 05:15 UTC = 13:15 北京时间（盘中，lianghua）
+15 9 * * mon-fri   # 09:15 UTC = 17:15 北京时间（盘后，lianghua + ashares 共用）
 ```
 
 Cloudflare cron **一律按 UTC 解释**，不要填北京时间。
+
+> ⚠️ **星期字段不要写 `1-5`**。Cloudflare 的星期是 **1 = 周日 … 7 = 周六**
+> （[官方文档](https://developers.cloudflare.com/workers/configuration/cron-triggers/)明确说明，
+> 与常见 cron 的 0/7 = 周日不同）。写 `1-5` 实际含义是「周日 ~ 周四」：
+> **周五整天不触发，周日白跑一次**（工作流内 `check_trading_day()` 会立刻退出，不推送）。
+> 用三字母缩写 `mon-fri`（等价 `2-6`）就没有歧义。
+> 这个坑真实发生过：2026-11-05 起的运行记录全是「周日~周四 17:15」，周五全部缺失。
+
+> 本账号 Free 计划 cron 额度已满（lianhua 2 + bigapush 3 = 5），ashares 直接**复用 17:15 这条 cron**，
+> 不再单独新增。若需要 ashares 在独立的 17:55 跑，需升级 Workers Paid（额度 1000）或挪动 lianghua 的盘后 cron。
+>
+> `TARGETS` 里的 `crons` 与 `[triggers] crons` **必须同步改**：Worker 先按字符串精确匹配，
+> 再按「时:分」兜底，写错了不会报错，只会表现为「cron 到了但谁也没触发」。
 
 ---
 

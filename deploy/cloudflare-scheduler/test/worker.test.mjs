@@ -3,8 +3,8 @@
  *
  *   cd deploy/cloudflare-scheduler && npm test
  *
- * 覆盖：存活探针、/health 诊断、/trigger 鉴权与触发、cron 触发、
- * 缺变量时的报错、GitHub 5xx 时的重试。
+ * 覆盖：存活探针、/health 诊断（多目标）、/trigger 鉴权与触发（含单目标/全量）、
+ * cron 触发（按目标匹配）、缺变量报错、GitHub 5xx 重试。
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -12,7 +12,7 @@ import worker from "../src/index.js";
 
 const realFetch = globalThis.fetch;
 
-function mockGithub({ dispatchStatus = 204, dispatchBody = "" } = {}) {
+function mockGithub({ dispatchStatus = 204 } = {}) {
   const calls = [];
   globalThis.fetch = async (url, init = {}) => {
     calls.push({ url: String(url), method: init.method || "GET" });
@@ -21,7 +21,7 @@ function mockGithub({ dispatchStatus = 204, dispatchBody = "" } = {}) {
       // 204 是 null-body 状态码，不能带 body
       return dispatchStatus === 204
         ? new Response(null, { status: 204 })
-        : new Response(dispatchBody, { status: dispatchStatus });
+        : new Response("boom", { status: dispatchStatus });
     }
     if (u.endsWith("/user")) {
       return Response.json({ login: "octocat" });
@@ -29,13 +29,7 @@ function mockGithub({ dispatchStatus = 204, dispatchBody = "" } = {}) {
     if (u.includes("/actions/workflows/") && u.includes("/runs")) {
       return Response.json({
         workflow_runs: [
-          {
-            id: 1,
-            event: "workflow_dispatch",
-            status: "completed",
-            conclusion: "success",
-            created_at: "2026-10-21T05:15:00Z",
-          },
+          { id: 1, event: "workflow_dispatch", status: "completed", conclusion: "success", created_at: "2026-10-21T05:15:00Z" },
         ],
       });
     }
@@ -47,14 +41,19 @@ function mockGithub({ dispatchStatus = 204, dispatchBody = "" } = {}) {
   return calls;
 }
 
+const TARGETS = JSON.stringify([
+  { name: "lianghua", owner: "xihaoxiao", repo: "lianghua", workflow: "daily_push.yml", ref: "main", crons: ["15 5 * * 1-5", "15 9 * * 1-5"] },
+  { name: "ashares", owner: "xihaoxiao", repo: "D-project-action", workflow: "daily.yml", ref: "main", crons: ["55 9 * * 1-5"] },
+]);
+
 const ENV = {
   GH_TOKEN: "ghp_test_token",
-  GITHUB_OWNER: "xihaoxiao",
-  GITHUB_REPO: "lianghua",
-  WORKFLOW_FILE: "daily_push.yml",
-  GITHUB_REF: "main",
+  TARGETS,
   TRIGGER_TOKEN: "s3cret",
 };
+
+const dispatches = (calls) => calls.filter((c) => c.url.endsWith("/dispatches"));
+const findTarget = (targets, name) => targets.find((t) => t.name === name);
 
 test.afterEach(() => {
   globalThis.fetch = realFetch;
@@ -69,30 +68,37 @@ test("GET / 返回存活文本", async () => {
   assert.match(await res.text(), /lianghua scheduler is running/);
 });
 
-test("GET /health 汇报变量与 GitHub 连通性", async () => {
+test("GET /health 汇报多目标与 GitHub 连通性", async () => {
   mockGithub();
   const res = await worker.fetch(new Request("https://x.workers.dev/health"), ENV);
   assert.equal(res.status, 200);
   const body = await res.json();
   assert.equal(body.ok, true);
-  assert.deepEqual(body.missing, []);
-  assert.equal(body.env.GITHUB_OWNER, "xihaoxiao");
-  assert.match(body.env.GH_TOKEN, /^set\(len=\d+\)$/);
-  assert.equal(body.github.token.ok, true);
-  assert.equal(body.github.token.login, "octocat");
-  assert.equal(body.github.workflow.ok, true);
-  assert.equal(body.github.recent_runs.items[0].event, "workflow_dispatch");
+  assert.equal(body.mode, "multi-target");
+  assert.equal(body.env.targets.length, 2);
+  // body.env.targets 是配置（repo 为纯仓库名）
+  const lhCfg = findTarget(body.env.targets, "lianghua");
+  assert.ok(lhCfg, "应包含 lianghua 配置");
+  assert.equal(lhCfg.repo, "lianghua");
+  const asCfg = findTarget(body.env.targets, "ashares");
+  assert.equal(asCfg.repo, "D-project-action");
+  // body.targets 是 GitHub 诊断结果（repo 为 owner/repo 全名）
+  const ghLh = findTarget(body.targets, "lianghua");
+  assert.ok(ghLh, "应包含 lianghua 诊断");
+  assert.equal(ghLh.repo, "xihaoxiao/lianghua");
+  assert.equal(ghLh.token.ok, true);
+  assert.equal(ghLh.token.login, "octocat");
 });
 
 test("GET /health 点名缺失的变量", async () => {
   globalThis.fetch = async () => {
     throw new Error("不应该发起网络请求");
   };
-  const res = await worker.fetch(new Request("https://x.workers.dev/health"), { ...ENV, GITHUB_REPO: "" });
+  const res = await worker.fetch(new Request("https://x.workers.dev/health"), { ...ENV, GH_TOKEN: "" });
   assert.equal(res.status, 500);
   const body = await res.json();
   assert.equal(body.ok, false);
-  assert.deepEqual(body.missing, ["GITHUB_REPO"]);
+  assert.deepEqual(body.missing, ["GH_TOKEN"]);
 });
 
 test("POST /trigger 拒绝错误 token", async () => {
@@ -103,34 +109,101 @@ test("POST /trigger 拒绝错误 token", async () => {
   assert.equal(res.status, 401);
 });
 
-test("POST /trigger 触发工作流", async () => {
+test("POST /trigger ?target=lianghua 只触发 lianghua", async () => {
   const calls = mockGithub();
-  const res = await worker.fetch(new Request("https://x.workers.dev/trigger?token=s3cret", { method: "POST" }), ENV);
+  const res = await worker.fetch(
+    new Request("https://x.workers.dev/trigger?token=s3cret&target=lianghua", { method: "POST" }),
+    ENV,
+  );
   assert.equal(res.status, 200);
   const body = await res.json();
   assert.equal(body.ok, true);
-  assert.equal(body.dispatched.status, 204);
-  const call = calls.find((c) => c.url.endsWith("/dispatches"));
-  assert.equal(call.method, "POST");
-  assert.equal(
-    call.url,
-    "https://api.github.com/repos/xihaoxiao/lianghua/actions/workflows/daily_push.yml/dispatches",
+  assert.equal(body.results.length, 1);
+  assert.equal(body.results[0].target, "lianghua");
+  const ds = dispatches(calls);
+  assert.equal(ds.length, 1);
+  assert.equal(ds[0].url, "https://api.github.com/repos/xihaoxiao/lianghua/actions/workflows/daily_push.yml/dispatches");
+});
+
+test("POST /trigger 不带 target 触发全部目标", async () => {
+  const calls = mockGithub();
+  const res = await worker.fetch(
+    new Request("https://x.workers.dev/trigger?token=s3cret", { method: "POST" }),
+    ENV,
   );
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.ok, true);
+  assert.equal(body.results.length, 2);
+  const ds = dispatches(calls);
+  assert.equal(ds.length, 2);
+});
+
+test("POST /trigger 未知 target 返回 404", async () => {
+  globalThis.fetch = async () => {
+    throw new Error("不应该发起网络请求");
+  };
+  const res = await worker.fetch(
+    new Request("https://x.workers.dev/trigger?token=s3cret&target=nope", { method: "POST" }),
+    ENV,
+  );
+  assert.equal(res.status, 404);
 });
 
 test("POST /trigger 把 GitHub 错误透出", async () => {
-  mockGithub({ dispatchStatus: 403, dispatchBody: "Resource not accessible by personal access token" });
-  const res = await worker.fetch(new Request("https://x.workers.dev/trigger?token=s3cret", { method: "POST" }), ENV);
+  mockGithub({ dispatchStatus: 403 });
+  const res = await worker.fetch(
+    new Request("https://x.workers.dev/trigger?token=s3cret&target=lianghua", { method: "POST" }),
+    ENV,
+  );
   assert.equal(res.status, 502);
   const body = await res.json();
   assert.equal(body.ok, false);
-  assert.match(body.error, /HTTP 403/);
+  assert.match(body.results[0].error, /HTTP 403/);
 });
 
-test("scheduled 在 cron 到点时触发工作流", async () => {
+test("scheduled 在命中目标的 cron 触发对应工作流", async () => {
   const calls = mockGithub();
+  // 15 5 UTC 只命中 lianghua（ashares 是 55 9）
   await worker.scheduled({ cron: "15 5 * * 1-5" }, ENV);
-  assert.equal(calls.filter((c) => c.url.endsWith("/dispatches")).length, 1);
+  let ds = dispatches(calls);
+  assert.equal(ds.length, 1);
+  assert.equal(ds[0].url, "https://api.github.com/repos/xihaoxiao/lianghua/actions/workflows/daily_push.yml/dispatches");
+
+  // 55 9 UTC 只命中 ashares
+  globalThis.fetch = realFetch;
+  const calls2 = mockGithub();
+  await worker.scheduled({ cron: "55 9 * * 1-5" }, ENV);
+  ds = dispatches(calls2);
+  assert.equal(ds.length, 1);
+  assert.equal(ds[0].url, "https://api.github.com/repos/xihaoxiao/D-project-action/actions/workflows/daily.yml/dispatches");
+});
+
+test("cron 星期写法不一致时按「时:分」兜底触发", async () => {
+  // 背景：Cloudflare 的星期字段 1=周日（不是周一），所以 `1-5` 实际是周日~周四。
+  // 若 wrangler.toml 改成 `mon-fri` 而 TARGETS 仍是 `1-5`（或反过来），
+  // 字符串匹配会全部落空 →「cron 到了但谁也没触发」的静默失败。
+  // 这里保证两处写法不同时，到点仍然发得出去。
+  const calls = mockGithub();
+  // TARGETS 里是 "15 9 * * 1-5"，实际触发写成 mon-fri
+  await worker.scheduled({ cron: "15 9 * * mon-fri" }, ENV);
+  let ds = dispatches(calls);
+  assert.equal(ds.length, 1);
+  assert.match(ds[0].url, /lianghua\/actions\/workflows\/daily_push\.yml/);
+
+  // 反向：TARGETS 里是 "55 9 * * 1-5"，实际触发写成 mon-fri
+  globalThis.fetch = realFetch;
+  const calls2 = mockGithub();
+  await worker.scheduled({ cron: "55 9 * * mon-fri" }, ENV);
+  ds = dispatches(calls2);
+  assert.equal(ds.length, 1);
+  assert.match(ds[0].url, /D-project-action\/actions\/workflows\/daily\.yml/);
+
+  // 时刻不同则不应误触发
+  globalThis.fetch = realFetch;
+  const calls3 = mockGithub();
+  await worker.scheduled({ cron: "30 9 * * mon-fri" }, ENV);
+  assert.equal(dispatches(calls3).length, 0);
 });
 
 test("scheduled 缺变量时抛出明确错误", async () => {
@@ -138,8 +211,8 @@ test("scheduled 缺变量时抛出明确错误", async () => {
     throw new Error("不应该发起网络请求");
   };
   await assert.rejects(
-    () => worker.scheduled({ cron: "15 5 * * 1-5" }, { ...ENV, GITHUB_OWNER: "" }),
-    /missing environment variables: GITHUB_OWNER/,
+    () => worker.scheduled({ cron: "15 5 * * 1-5" }, { ...ENV, GH_TOKEN: "" }),
+    /missing environment variables: GH_TOKEN/,
   );
 });
 
