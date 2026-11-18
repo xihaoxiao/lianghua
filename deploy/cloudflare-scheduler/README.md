@@ -17,8 +17,8 @@ GitHub 那边延迟几十分钟也会把当天的推送补上。工作流内的
 `concurrency: daily-push` + artifact 去重保证不会重复推送。
 
 > **多目标支持**：本 Worker 现在通过 `wrangler.toml` 里的 `TARGETS`（JSON 数组）同时触发多个仓库，
-> 每个目标可独立指定 cron。当前包含 `lianghua`（盘中 13:15 + 盘后 17:15）与 `ashares`
-> （`xihaoxiao/D-project-action` 的 `daily.yml`，盘后复用 17:15 那条 cron）。
+> 每个目标可独立指定 cron。当前包含 `lianghua`（午间 12:45 + 盘后 17:15）与 `ashares`
+> （`xihaoxiao/D-project-action` 的 `daily.yml`，同样跑午间 12:45 + 盘后 17:15 两次）。
 > 单目标变量（`GITHUB_OWNER` 等）仅在未配置 `TARGETS` 时作为回退生效。
 > 新增/移除目标只需改 `TARGETS`，然后 `wrangler deploy`。
 
@@ -49,8 +49,8 @@ GitHub 那边延迟几十分钟也会把当天的推送补上。工作流内的
 ### Cron Trigger（Worker → Settings → Triggers → Cron Triggers）
 
 ```
-15 5 * * mon-fri   # 05:15 UTC = 13:15 北京时间（盘中，lianghua）
-15 9 * * mon-fri   # 09:15 UTC = 17:15 北京时间（盘后，lianghua + ashares 共用）
+45 4 * * mon-fri   # 04:45 UTC = 12:45 北京时间（午间休市，两个目标共用）
+15 9 * * mon-fri   # 09:15 UTC = 17:15 北京时间（盘后，两个目标共用）
 ```
 
 Cloudflare cron **一律按 UTC 解释**，不要填北京时间。
@@ -62,8 +62,8 @@ Cloudflare cron **一律按 UTC 解释**，不要填北京时间。
 > 用三字母缩写 `mon-fri`（等价 `2-6`）就没有歧义。
 > 这个坑真实发生过：2026-11-05 起的运行记录全是「周日~周四 17:15」，周五全部缺失。
 
-> 本账号 Free 计划 cron 额度已满（lianhua 2 + bigapush 3 = 5），ashares 直接**复用 17:15 这条 cron**，
-> 不再单独新增。若需要 ashares 在独立的 17:55 跑，需升级 Workers Paid（额度 1000）或挪动 lianghua 的盘后 cron。
+> 本账号 Free 计划 cron 额度已满（lianhua 2 + bigapush 3 = 5），ashares 直接**复用这两条 cron**，
+> 不再单独新增。原 `15 5`（13:15）已改给午间 `45 4`（12:45），lianghua 的盘中推送也跟着提前半小时，仍在午休区间内。
 >
 > `TARGETS` 里的 `crons` 与 `[triggers] crons` **必须同步改**：Worker 先按字符串精确匹配，
 > 再按「时:分」兜底，写错了不会报错，只会表现为「cron 到了但谁也没触发」。
@@ -134,7 +134,7 @@ npx wrangler tail
 关键日志字段：
 
 ```json
-{"ts":"...","level":"info","msg":"cron fired","cron":"15 5 * * 1-5","beijing":"..."}
+{"ts":"...","level":"info","msg":"cron fired","cron":"45 4 * * mon-fri","beijing":"..."}
 {"ts":"...","level":"info","msg":"workflow dispatched","status":204,"elapsed_ms":412}
 {"ts":"...","level":"error","msg":"dispatch failed","status":403,"error":"GitHub dispatch failed: HTTP 403 ..."}
 ```
@@ -162,5 +162,5 @@ curl -H "Authorization: Bearer $GH_TOKEN" \
 | 日志 `HTTP 404` | 仓库名或工作流文件名错 | 检查 `GITHUB_OWNER`/`GITHUB_REPO`/`WORKFLOW_FILE` |
 | 日志 `HTTP 422` | 传了工作流里不存在的 input | 代码里默认不传 inputs |
 | 有运行但没推送 | 工作流内 artifact 去重判定当天已推过 | 看 `check-duplicate` job 输出 |
-| 推送时间还是不准 | Cron 表达式按 UTC 解释 | 05:15 UTC = 13:15 北京 |
+| 推送时间还是不准 | Cron 表达式按 UTC 解释 | 04:45 UTC = 12:45 北京 / 09:15 UTC = 17:15 北京 |
 | GitHub 上没看到运行 | `workflow_dispatch` 要求工作流文件在默认分支 | 确认 `daily_push.yml` 已在 main |

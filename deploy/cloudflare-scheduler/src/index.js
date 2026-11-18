@@ -22,7 +22,7 @@ const GH_API_VERSION = "2022-11-28";
 const USER_AGENT = "lianghua-cloudflare-scheduler";
 
 // 单目标回退时的历史默认 cron（保持 lianghua 原有行为）
-const DEFAULT_CRONS = ["15 5 * * mon-fri", "15 9 * * mon-fri"];
+const DEFAULT_CRONS = ["45 4 * * mon-fri", "15 9 * * mon-fri"];
 
 // ─────────────────────────────────────────────────────────────
 //  基础工具

@@ -41,9 +41,12 @@ function mockGithub({ dispatchStatus = 204 } = {}) {
   return calls;
 }
 
+// 线上真实配置：两个目标共用同样两条 cron（Free 计划 5 条额度已满，不能新增）
+//   45 4 UTC = 12:45 北京时间（午间休市）
+//   15 9 UTC = 17:15 北京时间（盘后）
 const TARGETS = JSON.stringify([
-  { name: "lianghua", owner: "xihaoxiao", repo: "lianghua", workflow: "daily_push.yml", ref: "main", crons: ["15 5 * * 1-5", "15 9 * * 1-5"] },
-  { name: "ashares", owner: "xihaoxiao", repo: "D-project-action", workflow: "daily.yml", ref: "main", crons: ["55 9 * * 1-5"] },
+  { name: "lianghua", owner: "xihaoxiao", repo: "lianghua", workflow: "daily_push.yml", ref: "main", crons: ["45 4 * * mon-fri", "15 9 * * mon-fri"] },
+  { name: "ashares", owner: "xihaoxiao", repo: "D-project-action", workflow: "daily.yml", ref: "main", crons: ["45 4 * * mon-fri", "15 9 * * mon-fri"] },
 ]);
 
 const ENV = {
@@ -162,21 +165,29 @@ test("POST /trigger 把 GitHub 错误透出", async () => {
   assert.match(body.results[0].error, /HTTP 403/);
 });
 
-test("scheduled 在命中目标的 cron 触发对应工作流", async () => {
+test("scheduled 午间 / 盘后两条 cron 都触发两个目标", async () => {
+  // 12:45 北京时间（午间休市）
   const calls = mockGithub();
-  // 15 5 UTC 只命中 lianghua（ashares 是 55 9）
-  await worker.scheduled({ cron: "15 5 * * 1-5" }, ENV);
+  await worker.scheduled({ cron: "45 4 * * mon-fri" }, ENV);
   let ds = dispatches(calls);
-  assert.equal(ds.length, 1);
-  assert.equal(ds[0].url, "https://api.github.com/repos/xihaoxiao/lianghua/actions/workflows/daily_push.yml/dispatches");
+  assert.equal(ds.length, 2);
+  assert.ok(ds.some((c) => c.url.includes("/xihaoxiao/lianghua/")), "午间应触发 lianghua");
+  assert.ok(ds.some((c) => c.url.includes("/xihaoxiao/D-project-action/")), "午间应触发 ashares");
 
-  // 55 9 UTC 只命中 ashares
+  // 17:15 北京时间（盘后）
   globalThis.fetch = realFetch;
   const calls2 = mockGithub();
-  await worker.scheduled({ cron: "55 9 * * 1-5" }, ENV);
+  await worker.scheduled({ cron: "15 9 * * mon-fri" }, ENV);
   ds = dispatches(calls2);
-  assert.equal(ds.length, 1);
-  assert.equal(ds[0].url, "https://api.github.com/repos/xihaoxiao/D-project-action/actions/workflows/daily.yml/dispatches");
+  assert.equal(ds.length, 2);
+  assert.ok(ds.some((c) => c.url.includes("/xihaoxiao/lianghua/")), "盘后应触发 lianghua");
+  assert.ok(ds.some((c) => c.url.includes("/xihaoxiao/D-project-action/")), "盘后应触发 ashares");
+
+  // 已经不再使用的旧时刻（13:15）不应再误触发
+  globalThis.fetch = realFetch;
+  const calls3 = mockGithub();
+  await worker.scheduled({ cron: "15 5 * * mon-fri" }, ENV);
+  assert.equal(dispatches(calls3).length, 0);
 });
 
 test("cron 星期写法不一致时按「时:分」兜底触发", async () => {
@@ -184,25 +195,31 @@ test("cron 星期写法不一致时按「时:分」兜底触发", async () => {
   // 若 wrangler.toml 改成 `mon-fri` 而 TARGETS 仍是 `1-5`（或反过来），
   // 字符串匹配会全部落空 →「cron 到了但谁也没触发」的静默失败。
   // 这里保证两处写法不同时，到点仍然发得出去。
+  const mismatchEnv = {
+    ...ENV,
+    TARGETS: JSON.stringify([
+      { name: "lianghua", owner: "xihaoxiao", repo: "lianghua", workflow: "daily_push.yml", ref: "main", crons: ["45 4 * * 1-5", "15 9 * * 1-5"] },
+      { name: "ashares", owner: "xihaoxiao", repo: "D-project-action", workflow: "daily.yml", ref: "main", crons: ["45 4 * * 1-5", "15 9 * * 1-5"] },
+    ]),
+  };
   const calls = mockGithub();
   // TARGETS 里是 "15 9 * * 1-5"，实际触发写成 mon-fri
-  await worker.scheduled({ cron: "15 9 * * mon-fri" }, ENV);
+  await worker.scheduled({ cron: "15 9 * * mon-fri" }, mismatchEnv);
   let ds = dispatches(calls);
-  assert.equal(ds.length, 1);
-  assert.match(ds[0].url, /lianghua\/actions\/workflows\/daily_push\.yml/);
+  assert.equal(ds.length, 2);
+  assert.ok(ds.some((c) => c.url.includes("/xihaoxiao/lianghua/")));
 
-  // 反向：TARGETS 里是 "55 9 * * 1-5"，实际触发写成 mon-fri
+  // 午间那条同样要兜底命中
   globalThis.fetch = realFetch;
   const calls2 = mockGithub();
-  await worker.scheduled({ cron: "55 9 * * mon-fri" }, ENV);
+  await worker.scheduled({ cron: "45 4 * * mon-fri" }, mismatchEnv);
   ds = dispatches(calls2);
-  assert.equal(ds.length, 1);
-  assert.match(ds[0].url, /D-project-action\/actions\/workflows\/daily\.yml/);
+  assert.equal(ds.length, 2);
 
   // 时刻不同则不应误触发
   globalThis.fetch = realFetch;
   const calls3 = mockGithub();
-  await worker.scheduled({ cron: "30 9 * * mon-fri" }, ENV);
+  await worker.scheduled({ cron: "30 9 * * mon-fri" }, mismatchEnv);
   assert.equal(dispatches(calls3).length, 0);
 });
 
@@ -211,7 +228,7 @@ test("scheduled 缺变量时抛出明确错误", async () => {
     throw new Error("不应该发起网络请求");
   };
   await assert.rejects(
-    () => worker.scheduled({ cron: "15 5 * * 1-5" }, { ...ENV, GH_TOKEN: "" }),
+    () => worker.scheduled({ cron: "45 4 * * mon-fri" }, { ...ENV, GH_TOKEN: "" }),
     /missing environment variables: GH_TOKEN/,
   );
 });
@@ -225,6 +242,7 @@ test("scheduled 遇到 5xx 会重试一次再报错", async () => {
     }
     return new Response("{}", { status: 200 });
   };
-  await assert.rejects(() => worker.scheduled({ cron: "15 5 * * 1-5" }, ENV), /HTTP 502/);
-  assert.equal(dispatchCalls, 2);
+  await assert.rejects(() => worker.scheduled({ cron: "45 4 * * mon-fri" }, ENV), /HTTP 502/);
+  // 两个目标都命中该 cron，每个各重试一次 → 2 个目标 × 2 次 = 4
+  assert.equal(dispatchCalls, 4);
 });
